@@ -8,7 +8,9 @@ import threading
 
 host = 'localhost'
 port = 5000
-
+global rows, columns
+rows=10
+columns=10
 # Global socket reference
 client_socket = None
 server_socket = None
@@ -376,13 +378,13 @@ def makeGameboard(board):
 def backToMainMenu():
     dimensions = []
 
-    def left_click(value):
-        if value == 1:
-            dimensions.append([6, 15])
-        elif value == 2:
-            dimensions.append([10, 25])
-        elif value == 3:
-            dimensions.append([14, 35])
+    def left_click():
+        rows = row_val.get()
+        columns = col_val.get()
+        if not rows.isdigit() or not columns.isdigit():
+            messagebox.showerror("Invalid Input", "Please enter valid integers for rows and columns.")
+            return
+        dimensions.append((int(rows), int(columns)))
         root.destroy()
 
     def on_closing():
@@ -402,13 +404,16 @@ def backToMainMenu():
 
     button_frame = tk.Frame(root)
     button_frame.pack(pady=20)
+    row_val = tk.StringVar(value=10)
+    col_val = tk.StringVar(value=10)
+    row_and_columns=tk.Label(button_frame, text = 'Grid Size', font = ('calibre',10,'bold')).grid(row=0, column=0, padx=10)
+    row_entry = tk.Entry(button_frame, textvariable=row_val, width=5).grid(row=0, column=1, padx=10)
+    tk.Label(button_frame, text = 'x', font = ('calibre',10,'bold')).grid(row=0, column=2, padx=10)
+    col_entry = tk.Entry(button_frame, textvariable=col_val, width=5).grid(row=0, column=3, padx=10)
 
-    tk.Button(button_frame, text="Easy",   padx=20, pady=10,
-              command=lambda: left_click(1)).grid(row=0, column=0, padx=10)
-    tk.Button(button_frame, text="Medium", padx=20, pady=10,
-              command=lambda: left_click(2)).grid(row=0, column=1, padx=10)
-    tk.Button(button_frame, text="Hard",   padx=20, pady=10,
-              command=lambda: left_click(3)).grid(row=0, column=2, padx=10)
+    tk.Button(button_frame, text="Start", padx=20, pady=10,
+              command=lambda: left_click()).grid(row=1, column=1, padx=10)
+    
 
     tk.Label(root,
              text="Instructions: \nLeft-click to choose difficulty \n\n"
@@ -424,8 +429,8 @@ def backToMainMenu():
     blank_actual = [['0'] * cols for _ in range(rows)]
 
     create_board(makeGameboard(placeholder), blank_actual,
-                 makeCoordinates(placeholder), makeVisited(placeholder),
-                 set(), 0, dimensions, placeholder)
+                makeCoordinates(placeholder), makeVisited(placeholder),
+                set(), 0, dimensions, placeholder)
 
 
 # Start socket server before menu
