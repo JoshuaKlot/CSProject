@@ -11,12 +11,13 @@ port = 5000
 global rows, columns
 rows=10
 columns=10
-# Global socket reference
+ 
 client_socket = None
 server_socket = None
+batch_mode = False   # set to True by solver when it wants no popups
+ 
  
 def start_server():
-    """Start socket server in background thread, accept one client."""
     global client_socket, server_socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -30,8 +31,8 @@ def start_server():
     except Exception as e:
         print(f"[Game] Socket error: {e}")
  
+ 
 def send_state(board, actual_board, game_over=False, won=False, total_mines=0):
-    """Send current visible board state to solver."""
     global client_socket
     if client_socket is None:
         return
@@ -49,9 +50,9 @@ def send_state(board, actual_board, game_over=False, won=False, total_mines=0):
     except Exception:
         pass
  
+ 
 def recv_move():
-    """Non-blocking receive of a move from solver. Returns (row, col) or None."""
-    global client_socket
+    global client_socket, batch_mode
     if client_socket is None:
         return None
     try:
@@ -65,6 +66,10 @@ def recv_move():
                 break
         if data:
             move = json.loads(data.decode().strip())
+            # Solver signals batch mode via a special message
+            if move.get("batch_mode"):
+                batch_mode = True
+                return None
             return move.get("row"), move.get("col"), move.get("action", "click")
     except BlockingIOError:
         return None
@@ -73,10 +78,7 @@ def recv_move():
  
  
 def generateRandomBoard(rows, col, mineCount=None, safeRow=None, safeCol=None):
-    """Generate a board with exactly mineCount mines, avoiding the safe zone on first click."""
     total_cells = rows * col
- 
-    # Build safe cells set (3x3 around first click)
     safe_cells = set()
     if safeRow is not None and safeCol is not None:
         for drow in range(-1, 2):
@@ -85,7 +87,6 @@ def generateRandomBoard(rows, col, mineCount=None, safeRow=None, safeCol=None):
                 if 0 <= nr < rows and 0 <= nc < col:
                     safe_cells.add((nr, nc))
  
-    # If mineCount not provided, fall back to ~1-in-6 random placement
     if mineCount is None:
         board = [[] for _ in range(rows)]
         actual_mine_count = 0
@@ -100,22 +101,14 @@ def generateRandomBoard(rows, col, mineCount=None, safeRow=None, safeCol=None):
                 board[i].append(ranchar)
         return [board, actual_mine_count]
  
-    # Exact mine placement
-    # Candidate cells exclude the safe zone
     all_cells = [(r, c) for r in range(rows) for c in range(col)]
     candidates = [cell for cell in all_cells if cell not in safe_cells]
- 
-    # Cap mine count so it fits
-    max_mines = len(candidates)
-    mineCount = min(mineCount, max_mines)
- 
+    mineCount = min(mineCount, len(candidates))
     mine_set = set(random.sample(candidates, mineCount))
- 
     board = [[] for _ in range(rows)]
     for i in range(rows):
         for j in range(col):
             board[i].append("M" if (i, j) in mine_set else "E")
- 
     return [board, mineCount]
  
  
@@ -225,7 +218,6 @@ def create_board(board, actualBoard, coordinates, vis, buttonsclear,
                      set(), newmineCount, dimensions, newboard, userMineCount)
  
     def get_visible_board():
-        """Build the visible board state for sending to solver."""
         visible = []
         for i in range(n):
             row = []
@@ -243,16 +235,17 @@ def create_board(board, actualBoard, coordinates, vis, buttonsclear,
         return visible
  
     def apply_solver_move():
-        """Check for a move from solver and apply it."""
         result = recv_move()
         if result and result[0] is not None:
             row, col, action = result
-            value = row * m + col
-            if action == "flag":
-                handle_right_click(value, buttons)
+            if row < 0:
+                # Negative row is a restart signal
+                handle_left_click(-1, buttons)
+            elif action == "flag":
+                handle_right_click(row * m + col, buttons)
             else:
-                handle_left_click(value, buttons)
-        root.after(200, apply_solver_move)
+                handle_left_click(row * m + col, buttons)
+        root.after(50 if batch_mode else 200, apply_solver_move)
  
     def handle_left_click(value, buttons):
         if value == -1:
@@ -286,25 +279,31 @@ def create_board(board, actualBoard, coordinates, vis, buttonsclear,
         if result == "Lost":
             send_state(get_visible_board(), actualBoard, game_over=True, won=False,
                        total_mines=mineCount_ref[0])
-            response = messagebox.askyesno(
-                "Game Over", " You Lost\n Do you want to replay?", icon='warning')
-            if response:
-                restart()
-            else:
-                close()
+            if not batch_mode:
+                response = messagebox.askyesno(
+                    "Game Over", " You Lost\n Do you want to replay?", icon='warning')
+                if response:
+                    restart()
+                else:
+                    close()
+            # In batch mode: solver will send row=-1 to trigger restart
+ 
         elif result == "Win":
             buttonlabel = actualBoard[row][col]
             button.config(text=buttonlabel, bg="lightblue",
                           state=tk.DISABLED, borderwidth=1)
             send_state(get_visible_board(), actualBoard, game_over=True, won=True,
                        total_mines=mineCount_ref[0])
-            response = messagebox.askyesno(
-                "You Won!", " You Cleared all the mines\n Do you want to replay?",
-                icon='info')
-            if response:
-                restart()
-            else:
-                close()
+            if not batch_mode:
+                response = messagebox.askyesno(
+                    "You Won!", " You Cleared all the mines\n Do you want to replay?",
+                    icon='info')
+                if response:
+                    restart()
+                else:
+                    close()
+            # In batch mode: solver will send row=-1 to trigger restart
+ 
         else:
             buttonlabel = actualBoard[row][col]
             button.config(text=buttonlabel, bg="lightblue",
@@ -338,7 +337,6 @@ def create_board(board, actualBoard, coordinates, vis, buttonsclear,
     root = tk.Tk()
     root.title("Minesweeper")
  
-    # Mine counter label at top
     mine_label = tk.Label(root, text=f"Mines: {mineCount_ref[0]}", font=("calibre", 10, "bold"))
     mine_label.grid(row=0, column=0, columnspan=m)
  
@@ -409,14 +407,12 @@ def backToMainMenu():
  
         r, c = int(rows_str), int(cols_str)
  
-        # Validate mine count
         user_mines = None
         if mines_str.strip() != "":
             if not mines_str.isdigit():
                 messagebox.showerror("Invalid Input", "Please enter a valid integer for mines.")
                 return
             user_mines = int(mines_str)
-            max_possible = r * c - 1  # at least one safe cell
             if user_mines < 1:
                 messagebox.showerror("Invalid Input", "Mine count must be at least 1.")
                 return
@@ -457,14 +453,12 @@ def backToMainMenu():
     col_val = tk.StringVar(value="10")
     mine_val = tk.StringVar(value="")
  
-    # Grid size row
     tk.Label(button_frame, text='Grid Size', font=('calibre', 10, 'bold')).grid(
         row=0, column=0, padx=10, sticky='e')
     tk.Entry(button_frame, textvariable=row_val, width=5).grid(row=0, column=1, padx=5)
     tk.Label(button_frame, text='x', font=('calibre', 10, 'bold')).grid(row=0, column=2)
     tk.Entry(button_frame, textvariable=col_val, width=5).grid(row=0, column=3, padx=5)
  
-    # Mines row
     tk.Label(button_frame, text='Mines', font=('calibre', 10, 'bold')).grid(
         row=1, column=0, padx=10, pady=8, sticky='e')
     mine_entry = tk.Entry(button_frame, textvariable=mine_val, width=5)
@@ -472,7 +466,6 @@ def backToMainMenu():
     tk.Label(button_frame, text='(leave blank for random)', font=('calibre', 8),
              fg='gray').grid(row=1, column=2, columnspan=2, sticky='w')
  
-    # Start button
     tk.Button(button_frame, text="Start", padx=20, pady=10,
               command=left_click).grid(row=2, column=0, columnspan=4, pady=6)
  
@@ -486,8 +479,8 @@ def backToMainMenu():
     root.mainloop()
  
  
-# Start socket server before menu
 t = threading.Thread(target=start_server, daemon=True)
 t.start()
  
 backToMainMenu()
+ 

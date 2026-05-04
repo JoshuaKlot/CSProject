@@ -1,72 +1,71 @@
 """
-Minesweeper Batch Solver
-========================
-Connects to the running minesweeper game via TCP socket, solves N games
-back-to-back (clicking "New Board" between games), then writes an Excel
-spreadsheet with per-game stats and aggregate summaries.
+Minesweeper Batch Runner (Headless)
+====================================
+Runs the solver N times with no GUI or socket connection.
+Produces an Excel spreadsheet with per-game stats and summaries.
  
 Usage:
-    python minesweeper_batch.py <num_games>
+    python minesweeper_batch_headless.py <num_games> [rows] [cols] [mines]
  
-Example:
-    python minesweeper_batch.py 100
- 
-Start your minesweeper game first, then run this script.
+Examples:
+    python minesweeper_batch_headless.py 100
+    python minesweeper_batch_headless.py 50 16 30 99
+    python minesweeper_batch_headless.py 200 9 9 10
 """
  
-import socket
-import json
-import time
 import random
 import sys
+import time
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
  
-HOST = 'localhost'
-PORT = 5000
-MOVE_DELAY = 0.05  # fast but still lets the GUI keep up
+# ── Board helpers ─────────────────────────────────────────────────────────────
  
-# ── Socket helpers ────────────────────────────────────────────────────────────
- 
-def connect():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    for attempt in range(20):
-        try:
-            s.connect((HOST, PORT))
-            print("[Batch] Connected to game.")
-            # Tell the game to suppress popups
-            s.sendall((json.dumps({"batch_mode": True}) + "\n").encode())
-            time.sleep(0.1)
-            return s
-        except ConnectionRefusedError:
-            print(f"[Batch] Waiting for game... ({attempt+1})")
-            time.sleep(1)
-    raise RuntimeError("Could not connect to game after 20 attempts.")
+def generate_board(rows, cols, mine_count, safe_r, safe_c):
+    safe_cells = {(safe_r + dr, safe_c + dc)
+                  for dr in range(-1, 2) for dc in range(-1, 2)
+                  if 0 <= safe_r + dr < rows and 0 <= safe_c + dc < cols}
+    candidates = [(r, c) for r in range(rows) for c in range(cols)
+                  if (r, c) not in safe_cells]
+    mine_count = min(mine_count, len(candidates))
+    mines = set(random.sample(candidates, mine_count))
+    return mines, mine_count
  
  
-def recv_state(sock, buf):
-    while b"\n" not in buf:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise ConnectionError("Game disconnected.")
-        buf += chunk
-    line, buf = buf.split(b"\n", 1)
-    return json.loads(line.decode()), buf
+def number_board(rows, cols, mines):
+    board = {}
+    for r in range(rows):
+        for c in range(cols):
+            if (r, c) in mines:
+                board[(r, c)] = 'M'
+            else:
+                count = sum(1 for dr in range(-1, 2) for dc in range(-1, 2)
+                            if (r + dr, c + dc) in mines)
+                board[(r, c)] = str(count)
+    return board
  
- 
-def send_move(sock, row, col, action="click"):
-    msg = json.dumps({"row": row, "col": col, "action": action}) + "\n"
-    sock.sendall(msg.encode())
- 
- 
-# ── Solver logic (Becerra 2015) ───────────────────────────────────────────────
  
 def get_neighbours(r, c, rows, cols):
     return [(r + dr, c + dc)
             for dr in range(-1, 2) for dc in range(-1, 2)
             if (dr, dc) != (0, 0) and 0 <= r + dr < rows and 0 <= c + dc < cols]
  
+ 
+def flood_reveal(start_r, start_c, actual, revealed, rows, cols):
+    stack = [(start_r, start_c)]
+    while stack:
+        r, c = stack.pop()
+        if (r, c) in revealed:
+            continue
+        revealed.add((r, c))
+        if actual[(r, c)] == '0':
+            for nr, nc in get_neighbours(r, c, rows, cols):
+                if (nr, nc) not in revealed:
+                    stack.append((nr, nc))
+ 
+ 
+# ── Solver (Becerra 2015) ─────────────────────────────────────────────────────
  
 def _propagate(constraints):
     safe = set()
@@ -124,15 +123,15 @@ def solve_step(board, rows, cols):
     constraints = []
     for r in range(rows):
         for c in range(cols):
-            cell = board[r][c]
-            if not cell.isdigit():
+            cell = board.get((r, c))
+            if cell is None or not cell.isdigit():
                 continue
             number = int(cell)
             neighbours = get_neighbours(r, c, rows, cols)
             unrevealed = set()
             flagged_count = 0
             for nr, nc in neighbours:
-                nb = board[nr][nc]
+                nb = board.get((nr, nc), 'E')
                 if nb == 'E':
                     unrevealed.add((nr, nc))
                 elif nb == 'F':
@@ -143,26 +142,17 @@ def solve_step(board, rows, cols):
             constraints.append((frozenset(unrevealed), remaining))
  
     safe, mines, constraints = _propagate(constraints)
-    moves = []
-    for (r, c) in sorted(mines):
-        if board[r][c] == 'E':
-            moves.append((r, c, 'flag'))
-    for (r, c) in sorted(safe):
-        if board[r][c] == 'E':
-            moves.append((r, c, 'click'))
-    return moves, constraints, mines
+    return safe, mines, constraints
  
  
-def choose_probabilistic(board, constraints, rows, cols, total_mines, known_mines):
+def choose_probabilistic(board, constraints, rows, cols, total_mines, flagged, known_mines):
     known_mines = known_mines or set()
     unrevealed = [(r, c) for r in range(rows) for c in range(cols)
-                  if board[r][c] == 'E' and (r, c) not in known_mines]
+                  if board.get((r, c), 'E') == 'E' and (r, c) not in known_mines]
     if not unrevealed:
         return None
  
-    flagged_count = sum(1 for r in range(rows) for c in range(cols) if board[r][c] == 'F')
-    mines_remaining = max(total_mines - flagged_count - len(known_mines), 0)
- 
+    mines_remaining = max(total_mines - len(flagged) - len(known_mines), 0)
     constrained = set()
     for cells, _ in constraints:
         constrained.update(cells)
@@ -181,24 +171,81 @@ def choose_probabilistic(board, constraints, rows, cols, total_mines, known_mine
  
     min_risk = min(risk.values())
     candidates = [p for p, v in risk.items() if v == min_risk]
-    r, c = random.choice(candidates)
-    return (r, c, 'click')
+    return random.choice(candidates)
  
  
-def first_move(board, rows, cols):
-    for r, c in [(rows // 2, cols // 2), (0, 0), (0, cols-1), (rows-1, 0), (rows-1, cols-1)]:
-        if board[r][c] == 'E':
-            return (r, c, 'click')
-    return (0, 0, 'click')
+# ── Single game ───────────────────────────────────────────────────────────────
  
+def run_game(rows, cols, mine_count):
+    first_r, first_c = rows // 2, cols // 2
+    mines, actual_mine_count = generate_board(rows, cols, mine_count, first_r, first_c)
+    actual = number_board(rows, cols, mines)
  
-def is_all_unrevealed(board):
-    return all(board[r][c] == 'E'
-               for r in range(len(board)) for c in range(len(board[0])))
+    revealed = set()
+    flagged  = set()
+    prob_moves = 0
  
+    def board_view():
+        v = {}
+        for r in range(rows):
+            for c in range(cols):
+                pos = (r, c)
+                if pos in flagged:
+                    v[pos] = 'F'
+                elif pos in revealed:
+                    v[pos] = actual[pos]
+                else:
+                    v[pos] = 'E'
+        return v
  
-def count_revealed(board):
-    return sum(1 for row in board for cell in row if cell not in ('E', 'F'))
+    def click(r, c):
+        if (r, c) in revealed or (r, c) in flagged:
+            return 'cont'
+        if (r, c) in mines:
+            return 'lost'
+        flood_reveal(r, c, actual, revealed, rows, cols)
+        if rows * cols - len(revealed) - len(flagged) == actual_mine_count - len(flagged):
+            return 'won'
+        return 'cont'
+ 
+    result = click(first_r, first_c)
+    if result != 'cont':
+        return dict(won=(result == 'won'), prob_moves=0,
+                    cells_revealed=len(revealed), total_cells=rows * cols,
+                    mines=actual_mine_count, rows=rows, cols=cols)
+ 
+    for _ in range(rows * cols * 4):
+        v = board_view()
+        safe, det_mines, constraints = solve_step(v, rows, cols)
+ 
+        for pos in det_mines:
+            flagged.add(pos)
+ 
+        if safe:
+            for pos in sorted(safe):
+                if pos not in revealed and pos not in flagged:
+                    result = click(*pos)
+                    if result in ('lost', 'won'):
+                        return dict(won=(result == 'won'), prob_moves=prob_moves,
+                                    cells_revealed=len(revealed), total_cells=rows * cols,
+                                    mines=actual_mine_count, rows=rows, cols=cols)
+            continue
+ 
+        v = board_view()
+        safe, det_mines, constraints = solve_step(v, rows, cols)
+        pos = choose_probabilistic(v, constraints, rows, cols,
+                                   actual_mine_count, flagged, det_mines)
+        if pos is None:
+            break
+        prob_moves += 1
+        result = click(*pos)
+        if result in ('lost', 'won'):
+            return dict(won=(result == 'won'), prob_moves=prob_moves,
+                        cells_revealed=len(revealed), total_cells=rows * cols,
+                        mines=actual_mine_count, rows=rows, cols=cols)
+ 
+    return dict(won=False, prob_moves=prob_moves, cells_revealed=len(revealed),
+                total_cells=rows * cols, mines=actual_mine_count, rows=rows, cols=cols)
  
  
 # ── Excel output ──────────────────────────────────────────────────────────────
@@ -244,19 +291,12 @@ def build_excel(results, out_path):
     for idx, r in enumerate(results, 1):
         row = idx + 1
         alt = (idx % 2 == 0)
-        vals = [
-            idx,
-            f"{r['rows']}x{r['cols']}",
-            r['rows'], r['cols'], r['total_cells'], r['mines'],
-            f"=F{row}/E{row}",
-            'Won' if r['won'] else 'Lost',
-            r['cells_revealed'],
-            f"=I{row}/E{row}",
-            r['prob_moves'],
-        ]
+        vals = [idx, f"{r['rows']}x{r['cols']}", r['rows'], r['cols'],
+                r['total_cells'], r['mines'], f"=F{row}/E{row}",
+                'Won' if r['won'] else 'Lost',
+                r['cells_revealed'], f"=I{row}/E{row}", r['prob_moves']]
         for ci, val in enumerate(vals, 1):
             style_data(ws.cell(row=row, column=ci, value=val), alt=alt)
- 
         rc = ws.cell(row=row, column=8)
         rc.fill = WIN_FILL if r['won'] else LOSS_FILL
         rc.font = Font(bold=True, name='Arial', size=10,
@@ -267,14 +307,13 @@ def build_excel(results, out_path):
     ws.freeze_panes = 'A2'
     ws.auto_filter.ref = ws.dimensions
  
-    # Summary sheet
     ws2 = wb.create_sheet('Summary')
     ws2.column_dimensions['A'].width = 34
     ws2.column_dimensions['B'].width = 20
  
     n = len(results)
     wins = sum(1 for r in results if r['won'])
-    ds = 2  # data start row in Game Results
+    ds = 2
  
     summary_rows = [
         ('OVERALL STATISTICS', None),
@@ -329,107 +368,37 @@ def build_excel(results, out_path):
     wb.save(out_path)
  
  
-# ── Main batch loop ───────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
  
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python minesweeper_batch.py <num_games>")
+        print("Usage: python minesweeper_batch_headless.py <num_games> [rows] [cols] [mines]")
         sys.exit(1)
  
     num_games = int(sys.argv[1])
-    print(f"[Batch] Will play {num_games} games.")
+    rows  = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+    cols  = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+    mines = int(sys.argv[4]) if len(sys.argv) > 4 else max(1, (rows * cols) // 6)
  
-    sock = connect()
-    buf  = b""
+    print(f"Running {num_games} games on {rows}x{cols} board with {mines} mines...")
+    t0 = time.time()
  
-    results     = []
-    move_queue  = []
-    prob_moves  = 0
-    total_mines = None
-    game_num    = 0
+    results = []
+    for i in range(num_games):
+        r = run_game(rows, cols, mines)
+        results.append(r)
+        status = 'W' if r['won'] else 'L'
+        print(f"  Game {i+1:4d}/{num_games}  {status}  prob_moves={r['prob_moves']:3d}  "
+              f"revealed={r['cells_revealed']:4d}/{r['total_cells']}", end='\r')
  
-    print("[Batch] Waiting for initial board state...")
- 
-    while game_num < num_games:
-        try:
-            state, buf = recv_state(sock, buf)
-        except ConnectionError:
-            print("[Batch] Game disconnected.")
-            break
- 
-        board     = state["board"]
-        rows      = state.get("rows", len(board))
-        cols      = state.get("cols", len(board[0]) if board else 0)
-        game_over = state.get("game_over", False)
-        won       = state.get("won", False)
- 
-        received_mines = state.get("total_mines", 0)
-        if received_mines > 0:
-            total_mines = received_mines
- 
-        effective_mines = total_mines if total_mines else max(1, (rows * cols) // 6)
- 
-        # ── Game ended ────────────────────────────────────────────────────────
-        if game_over:
-            revealed = count_revealed(board)
-            results.append({
-                'won': won,
-                'prob_moves': prob_moves,
-                'cells_revealed': revealed,
-                'total_cells': rows * cols,
-                'mines': effective_mines,
-                'rows': rows,
-                'cols': cols,
-            })
-            game_num += 1
-            status = "WON " if won else "LOST"
-            print(f"[Batch] Game {game_num}/{num_games}  {status}  "
-                  f"prob_moves={prob_moves}  revealed={revealed}/{rows*cols}")
- 
-            move_queue.clear()
-            prob_moves  = 0
-            total_mines = None
- 
-            if game_num < num_games:
-                # Trigger "New Board" — the game handles row=-1 as a restart
-                time.sleep(0.25)
-                send_move(sock, -1, 0, "click")
-            continue
- 
-        # ── Playing ───────────────────────────────────────────────────────────
-        if not move_queue:
-            if is_all_unrevealed(board):
-                move_queue.append(first_move(board, rows, cols))
-            else:
-                moves, constraints, known_mines = solve_step(board, rows, cols)
-                if moves:
-                    move_queue.extend(moves)
-                else:
-                    move = choose_probabilistic(board, constraints, rows, cols,
-                                                effective_mines, known_mines)
-                    if move:
-                        prob_moves += 1
-                        move_queue.append(move)
- 
-        if move_queue:
-            r, c, action = move_queue.pop(0)
-            send_move(sock, r, c, action)
-            time.sleep(MOVE_DELAY)
- 
-    # ── Save results ──────────────────────────────────────────────────────────
-    sock.close()
- 
-    if not results:
-        print("[Batch] No results to save.")
-        return
+    elapsed = time.time() - t0
+    wins = sum(1 for r in results if r['won'])
+    print(f"\nDone in {elapsed:.1f}s — {wins}/{num_games} won ({100*wins/num_games:.1f}%)")
  
     out = 'minesweeper_results.xlsx'
     build_excel(results, out)
-    wins = sum(1 for r in results if r['won'])
-    print(f"\n[Batch] Done!  {wins}/{len(results)} won ({100*wins/len(results):.1f}%)")
-    print(f"[Batch] Spreadsheet saved: {out}")
+    print(f"Spreadsheet saved to {out}")
  
  
 if __name__ == '__main__':
     main()
- 
